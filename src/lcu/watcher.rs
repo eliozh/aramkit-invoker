@@ -48,12 +48,18 @@ impl WatcherHandle {
     }
 
     pub fn browser_bounds(&self) -> Option<WindowBounds> {
-        self.window.lock().unwrap_or_else(|error| error.into_inner()).bounds()
+        self.window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bounds()
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.window.lock().unwrap_or_else(|error| error.into_inner()).close();
+        self.window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
     }
 }
 
@@ -163,7 +169,9 @@ fn poll_client(
                 let port_state = port_state(credentials.port);
                 let client_gone = matches!(port_state, PortState::Closed);
                 let credentials_rejected = error.chain().any(|cause| {
-                    cause.downcast_ref::<reqwest::Error>().and_then(reqwest::Error::status)
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .and_then(reqwest::Error::status)
                         == Some(reqwest::StatusCode::UNAUTHORIZED)
                 });
                 if client_gone || credentials_rejected || gameflow_errors >= 20 {
@@ -237,8 +245,8 @@ fn poll_client(
         if phase == "ChampSelect" {
             game_start_since = None;
             retry_page_after = None;
-            let new_session = previous_phase.as_str() != "ChampSelect"
-                || tracker.has_different_game(game_id);
+            let new_session =
+                previous_phase.as_str() != "ChampSelect" || tracker.has_different_game(game_id);
             if new_session {
                 tracker.begin_champ_select(game_id, mayhem);
             }
@@ -337,7 +345,11 @@ fn poll_client(
                 message = opened_message;
                 if !opened {
                     tracker.begin_champ_select(trigger.game_id, Some(true));
-                    tracker.update_champ_select(trigger.game_id, Some(true), Some(trigger.champion_id));
+                    tracker.update_champ_select(
+                        trigger.game_id,
+                        Some(true),
+                        Some(trigger.champion_id),
+                    );
                     retry_page_after = Some(Instant::now() + Duration::from_secs(5));
                 }
             }
@@ -369,7 +381,11 @@ fn handle_trigger(
     wake: &Wake,
     window: &Mutex<ChampionWindow>,
 ) -> (i64, String, String, bool) {
-    if catalog.as_ref().and_then(|catalog| catalog.get(trigger.champion_id)).is_none() {
+    if catalog
+        .as_ref()
+        .and_then(|catalog| catalog.get(trigger.champion_id))
+        .is_none()
+    {
         refresh_catalog(client, credentials, catalog, catalog_error_logged, tx, wake);
     }
 
@@ -451,7 +467,10 @@ fn open_champion_page(
 }
 
 fn open_managed_window(window: &Mutex<ChampionWindow>, url: &str) -> Result<(), String> {
-    window.lock().unwrap_or_else(|error| error.into_inner()).open(url)
+    window
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .open(url)
 }
 
 fn emit_status(

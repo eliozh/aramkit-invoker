@@ -229,8 +229,7 @@ fn credentials_from_lockfiles(roots: &[PathBuf]) -> Option<LcuCredentials> {
 
 fn port_accepts_connections(credentials: &LcuCredentials) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], credentials.port));
-    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300))
-        .is_ok()
+    std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300)).is_ok()
 }
 
 fn credentials_from_logs(roots: &[PathBuf]) -> Option<LcuCredentials> {

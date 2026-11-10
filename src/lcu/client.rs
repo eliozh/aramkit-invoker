@@ -36,7 +36,9 @@ pub fn fetch_gameflow(client: &Client, credentials: &LcuCredentials) -> Result<G
             ..GameflowSession::default()
         });
     }
-    let response = response.error_for_status().context("游戏流程接口返回错误")?;
+    let response = response
+        .error_for_status()
+        .context("游戏流程接口返回错误")?;
     read_json(response, "游戏流程数据")
 }
 
