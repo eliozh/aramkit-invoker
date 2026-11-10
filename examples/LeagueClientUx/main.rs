@@ -11,12 +11,14 @@ use std::env;
 use std::process::{self, Command};
 use std::thread;
 
-use mock_core::{resolve_launch, select_ephemeral_port, CliConfig, CliError, MockServer, Mode};
+use mock_core::{
+    collect_utf8_args, resolve_launch, select_ephemeral_port, CliConfig, CliError, MockServer, Mode,
+};
 
 fn main() {
-    let argv: Vec<String> = env::args().collect();
-
-    let error = match run(argv) {
+    // `env::args()` panics on non-UTF-8 argv; `collect_utf8_args` turns that
+    // into a clear usage error instead.
+    let error = match collect_utf8_args(env::args_os()).and_then(run) {
         Ok(()) => return,
         Err(error) => error,
     };

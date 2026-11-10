@@ -38,6 +38,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const HEAD_READ_DEADLINE: Duration = Duration::from_secs(5);
 /// Poll interval while the non-blocking listener waits for a connection.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Stop serving after this many consecutive accept failures; a persistent
+/// listener error is not recoverable by polling, and retrying forever would
+/// spin the CPU and flood stderr.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 100;
 
 const SESSION_PATH: &str = "/lol-gameflow/v1/session";
 const PHASE_PATH: &str = "/lol-gameflow/v1/gameflow-phase";
@@ -78,6 +82,24 @@ const ALLOWED_PHASES: [&str; 12] = [
     "PreEndOfGame",
     "FailedToLaunch",
     "TerminatedInError",
+];
+
+/// Every flag the parser recognizes. Used to tell a missing value from a
+/// value that legitimately begins with `--` (for example a token).
+const KNOWN_FLAGS: [&str; 13] = [
+    "--app-port",
+    "--remoting-auth-token",
+    "--mode",
+    "--scenario",
+    "--phase",
+    "--queue-id",
+    "--game-mode",
+    "--champion-id",
+    "--local-cell-id",
+    "--step-ms",
+    "--install-root",
+    "--reject-auth",
+    "--gameflow-phase-only",
 ];
 
 /// (id, name, alias) entries shipped in every champion summary.
@@ -302,6 +324,25 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// Converts OS arguments into UTF-8 strings.
+///
+/// `std::env::args()` panics on a non-UTF-8 argument; the CLI is string based,
+/// so callers pass `args_os()` here to turn that case into a clear usage error.
+/// The offending argument is deliberately not printed.
+#[allow(dead_code)]
+pub fn collect_utf8_args<I>(args: I) -> Result<Vec<String>, CliError>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter()
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| CliError::usage("命令行参数必须是有效的 UTF-8"))
+        })
+        .collect()
+}
+
 /// Fully validated command line. The token is never rendered unredacted.
 #[derive(Clone)]
 pub struct CliConfig {
@@ -361,10 +402,16 @@ impl CliConfig {
 
             match name {
                 "--app-port" => {
+                    if raw.app_port.is_some() {
+                        return Err(CliError::usage("--app-port 只能指定一次"));
+                    }
                     let value = take_value(&arguments, &mut index, name, inline)?;
                     raw.app_port = Some(parse_port(&value)?);
                 }
                 "--remoting-auth-token" => {
+                    if raw.remoting_auth_token.is_some() {
+                        return Err(CliError::usage("--remoting-auth-token 只能指定一次"));
+                    }
                     let value = take_value(&arguments, &mut index, name, inline)?;
                     if !is_valid_token(&value) {
                         return Err(CliError::usage(
@@ -416,6 +463,9 @@ impl CliConfig {
                 }
                 "--install-root" => {
                     let value = take_value(&arguments, &mut index, name, inline)?;
+                    if value.is_empty() {
+                        return Err(CliError::usage("--install-root 不能为空"));
+                    }
                     raw.install_root = Some(PathBuf::from(value));
                 }
                 "--reject-auth" => {
@@ -556,10 +606,15 @@ fn take_value(
         return Ok(value.to_owned());
     }
 
+    // Only a known flag name marks the value as missing. A value such as
+    // `--abc` that merely starts with `--` is a legal token.
     let value = arguments
         .get(*index + 1)
-        .filter(|value| !value.starts_with("--"))
         .ok_or_else(|| CliError::usage(format!("{name} 缺少取值")))?;
+    let (next_name, _) = split_flag(value);
+    if KNOWN_FLAGS.contains(&next_name) {
+        return Err(CliError::usage(format!("{name} 缺少取值")));
+    }
     *index += 2;
     Ok(value.clone())
 }
@@ -625,7 +680,7 @@ pub fn is_valid_token(token: &str) -> bool {
 }
 
 /// The outcome of process-mode launch resolution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LaunchResolution {
     pub port: u16,
     pub token: String,
@@ -633,6 +688,52 @@ pub struct LaunchResolution {
     pub reexec: bool,
     /// Child argv (including the program name) when `reexec` is true.
     pub args: Vec<String>,
+}
+
+impl fmt::Debug for LaunchResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LaunchResolution")
+            .field("port", &self.port)
+            .field("token", &REDACTED)
+            .field("reexec", &self.reexec)
+            .field("args", &RedactedArgs(&self.args))
+            .finish()
+    }
+}
+
+/// Renders an argv with credential values replaced by `<redacted>` so an
+/// accidental `{:?}` cannot leak a token.
+struct RedactedArgs<'a>(&'a [String]);
+
+impl fmt::Debug for RedactedArgs<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = formatter.debug_list();
+        let mut index = 0;
+        while index < self.0.len() {
+            let argument = &self.0[index];
+            let is_separated_secret =
+                argument == "--app-port" || argument == "--remoting-auth-token";
+            if is_separated_secret {
+                list.entry(argument);
+                if self.0.get(index + 1).is_some() {
+                    list.entry(&REDACTED);
+                    index += 1;
+                }
+            } else {
+                let (name, inline) = split_flag(argument);
+                let is_inline_secret =
+                    inline.is_some() && (name == "--app-port" || name == "--remoting-auth-token");
+                if is_inline_secret {
+                    list.entry(&format!("{name}={REDACTED}"));
+                } else {
+                    list.entry(argument);
+                }
+            }
+            index += 1;
+        }
+        list.finish()
+    }
 }
 
 /// Binds `127.0.0.1:0` just long enough to learn a free port (ADR-0001).
@@ -812,7 +913,12 @@ impl MockServer {
         self.address
     }
 
-    /// The shared scenario state, mirroring the handle the CLI exposes.
+    /// The shared static scenario state.
+    ///
+    /// A schedule takes precedence over this handle: when the server was
+    /// started with `Some(schedule)`, every request is answered from the
+    /// schedule and mutations to this handle have no effect. Without a
+    /// schedule, this is the live state the server reads.
     #[allow(dead_code)]
     pub fn state(&self) -> Arc<RwLock<MockState>> {
         Arc::clone(&self.state)
@@ -833,7 +939,11 @@ impl Drop for MockServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                // The panic payload is discarded so nothing it carried (for
+                // example a credential) can reach stderr.
+                eprintln!("mock-lcu: server thread panicked during shutdown");
+            }
         }
     }
 }
@@ -857,9 +967,11 @@ fn serve(
     stop: &AtomicBool,
     scheduled: Option<&ScheduledState>,
 ) {
+    let mut consecutive_accept_errors = 0u32;
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                consecutive_accept_errors = 0;
                 // A socket we cannot configure (blocking mode and both
                 // timeouts) has no slowloris bound; close it instead of
                 // serving it without those guards.
@@ -874,9 +986,22 @@ fn serve(
                 handle_connection(&mut tls, state, options, expected_credential, scheduled);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // No pending connection: not an error, and it ends any burst.
+                consecutive_accept_errors = 0;
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            Err(_) => thread::sleep(ACCEPT_POLL_INTERVAL),
+            Err(error) => {
+                // Log once per burst, then give up after the bounded count.
+                if consecutive_accept_errors == 0 {
+                    eprintln!("mock-lcu: accept 失败：{error}");
+                }
+                consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                    eprintln!("mock-lcu: accept 连续失败 {consecutive_accept_errors} 次，停止监听");
+                    break;
+                }
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
         }
     }
 }

@@ -791,6 +791,104 @@ mod mock_lcu_tests {
     }
 
     #[test]
+    fn launch_resolution_debug_redacts_token_and_args() {
+        let token = "debug-secret-token";
+        let argv = owned(&[
+            "LeagueClientUx",
+            "--remoting-auth-token",
+            token,
+            "--app-port",
+            "1234",
+        ]);
+        let resolution = resolve_launch(
+            &argv,
+            None,
+            None,
+            || Ok::<u16, std::io::Error>(54_321),
+            || Ok::<String, std::io::Error>(token.to_owned()),
+        )
+        .expect("resolution");
+
+        let debug = format!("{resolution:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            !debug.contains(token),
+            "Debug must not print the token: {debug}"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_duplicate_credential_flags() {
+        for argv in [
+            owned(&["LeagueClientUx", "--app-port", "1234", "--app-port=1235"]),
+            owned(&["LeagueClientUx", "--app-port=1234", "--app-port", "1235"]),
+            owned(&[
+                "LeagueClientUx",
+                "--remoting-auth-token",
+                "first-token",
+                "--remoting-auth-token=second-token",
+            ]),
+        ] {
+            let error = CliConfig::parse_from(argv).expect_err("duplicate credential flag");
+            assert_eq!(error.exit_code(), 2);
+            assert!(
+                error.to_string().contains("--app-port")
+                    || error.to_string().contains("--remoting-auth-token"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_take_value_accepts_dash_prefixed_token_and_rejects_missing_value() {
+        let config = parse_config(&["LeagueClientUx", "--remoting-auth-token", "--abc"])
+            .expect("a token may begin with --");
+        assert_eq!(config.remoting_auth_token.as_deref(), Some("--abc"));
+
+        let missing = parse_config(&["LeagueClientUx", "--app-port", "--step-ms", "500"])
+            .expect_err("missing value before a known flag");
+        assert_eq!(missing.exit_code(), 2);
+        assert!(missing.to_string().contains("--app-port"), "{missing}");
+        assert!(missing.to_string().contains("缺少取值"), "{missing}");
+    }
+
+    #[test]
+    fn cli_rejects_empty_install_root() {
+        for argv in [
+            owned(&["LeagueClientUx", "--mode", "lockfile", "--install-root="]),
+            owned(&["LeagueClientUx", "--mode", "log", "--install-root", ""]),
+        ] {
+            let error = CliConfig::parse_from(argv).expect_err("empty install root");
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains("--install-root"), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_are_rejected_with_a_usage_error() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = vec![
+            OsString::from("LeagueClientUx"),
+            OsString::from_vec(vec![0xff, 0xfe]),
+        ];
+        let error = super::mock_core::collect_utf8_args(invalid)
+            .expect_err("non-UTF-8 arguments must be rejected");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+
+        let parsed = super::mock_core::collect_utf8_args(vec![
+            OsString::from("LeagueClientUx"),
+            OsString::from("--app-port"),
+            OsString::from("54321"),
+        ])
+        .expect("valid UTF-8 arguments");
+        assert_eq!(parsed, vec!["LeagueClientUx", "--app-port", "54321"]);
+    }
+
+    #[test]
     fn resolve_launch_advertises_exactly_one_flag_pair() {
         let argv = owned(&["LeagueClientUx", "--step-ms", "500"]);
         let resolution = resolve_launch(
