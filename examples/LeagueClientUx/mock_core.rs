@@ -2,14 +2,15 @@
 //!
 //! This file is compiled twice: as the core of the `LeagueClientUx` example
 //! and as a `#[cfg(test)]` module of the library crate. It therefore uses only
-//! the standard library, the four pinned dev-dependencies, and `serde_json`.
-//! It must never reference `crate::`, and no release build compiles it.
+//! the standard library, the five pinned dev-dependencies (including `libc`),
+//! and `serde_json`. It must never reference `crate::`, and no release build
+//! compiles it.
 //!
 //! The implementation is split into focused modules and re-exported here so
 //! both consumers keep using one `mock_core` facade:
 //!
-//! - [`cli`]: argument parsing, validation, process launch resolution, and the
-//!   scoped lockfile/log discovery writers.
+//! - [`cli`]: argument parsing, validation, and process launch resolution.
+//! - [`discovery`]: the scoped `lockfile`/client-log writers and path safety.
 //! - [`schedule`]: the pure scenario timeline.
 //! - [`server`]: the loopback TLS server, request parsing, and routing.
 //! - [`fixtures`]: scenario state, options, and JSON fixture bodies.

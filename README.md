@@ -109,11 +109,14 @@ cargo run --example LeagueClientUx -- --scenario mayhem
 `--install-root` 只能用于 `lockfile`/`log` 模式（在 `process` 模式下会以退出码 2 拒绝）。默认根目录是 mock
 可执行文件所在目录。写入前会严格校验根目录：
 
-- 必须是**已存在的绝对目录**；拒绝相对路径、UNC 路径（`\\server\share`、`//server/share`）、`..` 和符号链接。
-- 拒绝已知的 Riot/Tencent/WeGame 安装前缀，以及包含 `LeagueClient.exe`、或包含非 mock 自身的
-  `LeagueClientUx.exe` 的目录。
-- 只允许上述两种输出路径；Unix 上文件权限为 `0600`，Windows 使用目录默认 ACL。
-- 收到 SIGINT（Ctrl+C，Windows 同样适用）或 SIGTERM 时，mock 会先停止监听、删除它创建的发现文件，再以退出码 0 结束。
+- 必须是**已存在的绝对目录**；拒绝相对路径、UNC 路径（`\\server\share`、`//server/share`）、`..`、
+  符号链接，以及任何上级目录中包含 `LeagueClient.exe`（或非 mock 自身的 `LeagueClientUx.exe`）的根目录。
+  根目录会先规范化为真实路径；所有写入只使用该规范路径，绝不使用原始输入。
+- 拒绝已知的 Riot/Tencent/WeGame 安装前缀（按规范化后的前缀比较，Windows 上先折叠路径组件的尾随点/空格）。
+- 只允许上述两种输出路径；Unix 上文件权限为 `0600`、新建目录为 `0700`，Windows 使用目录默认 ACL。
+  lockfile 以 `O_NOFOLLOW` 打开（Unix），日志文件用 `create_new` 创建并在重名时追加数字后缀。
+- 在 Unix 上，收到 SIGINT、SIGTERM、SIGHUP 或 SIGQUIT 时，mock 会先停止监听、删除它创建的发现文件，
+  再以退出码 0 结束；Windows 上仅 SIGINT（Ctrl+C）可用，Ctrl+C 同样会清理并以退出码 0 结束。
 - SIGKILL（`kill -9`）和 SIGSTOP 不能被进程处理，因此会留下发现文件；请始终使用临时根目录，必要时手动删除。
 
 示例（PowerShell，Candidate B）：

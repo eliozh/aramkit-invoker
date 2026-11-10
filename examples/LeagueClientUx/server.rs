@@ -18,6 +18,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::Value;
 
+use super::cli::CliError;
 use super::fixtures::{
     champ_select_body, champion_summary_body, gameflow_body, MockOptions, MockState,
 };
@@ -71,22 +72,36 @@ pub fn shutdown_flag() -> &'static AtomicBool {
 }
 
 /// Installs the graceful-stop handlers: SIGINT everywhere (Windows maps it to
-/// the CRT's Ctrl+C handling) and SIGTERM on Unix.
+/// the CRT's Ctrl+C handling) and SIGTERM, SIGHUP, and SIGQUIT on Unix.
+///
+/// Returns an error when the OS refuses a registration, so the caller can fail
+/// fast rather than run without the cleanup path.
 #[allow(dead_code)]
-pub fn install_shutdown_handlers() {
-    // SAFETY: `request_shutdown` has the `sighandler_t`-compatible signature
-    // and performs only one atomic store, which is async-signal-safe.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            request_shutdown as *const () as libc::sighandler_t,
-        );
-        #[cfg(unix)]
-        libc::signal(
-            libc::SIGTERM,
-            request_shutdown as *const () as libc::sighandler_t,
-        );
+pub fn install_shutdown_handlers() -> Result<(), CliError> {
+    install_signal(libc::SIGINT)?;
+    #[cfg(unix)]
+    {
+        install_signal(libc::SIGTERM)?;
+        install_signal(libc::SIGHUP)?;
+        install_signal(libc::SIGQUIT)?;
     }
+    Ok(())
+}
+
+/// Registers [`request_shutdown`] for one signal and checks the result.
+fn install_signal(signal: libc::c_int) -> Result<(), CliError> {
+    // SAFETY: `request_shutdown` has the `sighandler_t`-compatible signature
+    // and its body is a single atomic store, which is async-signal-safe. The
+    // returned previous handler is compared, not called.
+    let previous =
+        unsafe { libc::signal(signal, request_shutdown as *const () as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        let error = std::io::Error::last_os_error();
+        return Err(CliError::runtime(format!(
+            "无法为信号 {signal} 注册清理处理器：{error}"
+        )));
+    }
+    Ok(())
 }
 
 /// Blocks until `flag` is set, then runs `on_stop` exactly once.

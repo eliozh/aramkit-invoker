@@ -31,15 +31,25 @@ fn main() {
 fn run(argv: Vec<String>) -> Result<(), CliError> {
     let config = CliConfig::parse_from(&argv)?;
 
-    // SIGINT/SIGTERM set the process-wide flag; both serve paths poll it and
-    // run their cleanup instead of dying without unwinding. The re-exec parent
-    // also ignores it: it keeps waiting for the child, which cleans up.
-    install_shutdown_handlers();
+    // SIGINT (and SIGTERM/SIGHUP/SIGQUIT on Unix) set the process-wide flag;
+    // both serve paths poll it and run their cleanup instead of dying without
+    // unwinding. The re-exec parent also ignores it: it keeps waiting for the
+    // child, which cleans up.
+    install_shutdown_handlers()?;
 
     match config.mode {
         Mode::Process => run_process(argv, config),
-        Mode::Lockfile | Mode::Log => run_discovery(config),
+        Mode::Lockfile => run_discovery(config, DiscoveryMode::Lockfile),
+        Mode::Log => run_discovery(config, DiscoveryMode::Log),
     }
+}
+
+/// The two discovery-file shapes `run_discovery` can serve. Passing this
+/// instead of the full [`Mode`] makes the process mode unrepresentable.
+#[derive(Clone, Copy)]
+enum DiscoveryMode {
+    Lockfile,
+    Log,
 }
 
 fn run_process(argv: Vec<String>, config: CliConfig) -> Result<(), CliError> {
@@ -77,7 +87,7 @@ fn reexec(args: &[String]) -> Result<(), CliError> {
 /// the error return drops the `DiscoveryFile`, which removes the file again.
 /// These modes never re-exec and never advertise credential flags in argv; the
 /// app is expected to fall through to Candidate B discovery (ADR-0001).
-fn run_discovery(config: CliConfig) -> Result<(), CliError> {
+fn run_discovery(config: CliConfig, mode: DiscoveryMode) -> Result<(), CliError> {
     let port = match config.app_port.filter(|port| *port > 0) {
         Some(port) => port,
         None => select_ephemeral_port()
@@ -95,10 +105,9 @@ fn run_discovery(config: CliConfig) -> Result<(), CliError> {
     };
 
     // Validation happens inside the writer, before any filesystem mutation.
-    let discovery = match config.mode {
-        Mode::Lockfile => write_lockfile(&root, port, &token)?,
-        Mode::Log => write_log(&root, port, &token)?,
-        Mode::Process => unreachable!("process mode never writes discovery files"),
+    let discovery = match mode {
+        DiscoveryMode::Lockfile => write_lockfile(&root, port, &token)?,
+        DiscoveryMode::Log => write_log(&root, port, &token)?,
     };
 
     let server = MockServer::start_on(

@@ -3,6 +3,10 @@
 *.ilk
 .DS_Store
 
+# Mock LCU discovery output (generated per run; contains a mock-only token)
+lockfile
+*_LeagueClientUx.log
+
 # ECC workflow local records
 .claude/*.local.md
 .claude/settings.local.json

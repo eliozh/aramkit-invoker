@@ -1482,6 +1482,105 @@ mod mock_lcu_tests {
     }
 
     #[test]
+    fn rejects_root_nested_under_real_install_marker() {
+        let base = tempfile::tempdir().expect("temp dir");
+        std::fs::write(base.path().join("LeagueClient.exe"), b"").expect("marker");
+        let nested = base.path().join("nested").join("mock-root");
+        std::fs::create_dir_all(&nested).expect("nested root");
+        let port = 50_414u16;
+        let token = generate_token().expect("token");
+
+        let error = write_lockfile(&nested, port, &token)
+            .expect_err("an ancestor LeagueClient.exe must reject the root");
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(!nested.join("lockfile").exists());
+
+        std::fs::remove_file(base.path().join("LeagueClient.exe")).expect("unmark");
+        std::fs::write(base.path().join("LeagueClientUx.exe"), b"").expect("ux marker");
+        let error = write_lockfile(&nested, port, &token)
+            .expect_err("an ancestor foreign LeagueClientUx.exe must reject the root");
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(!nested.join("lockfile").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_or_rejects_root_under_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().expect("temp dir");
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        let nested = real.join("mock-root");
+        std::fs::create_dir(&nested).expect("nested root");
+        let linked = base.path().join("linked");
+        symlink(&real, &linked).expect("ancestor symlink");
+        let requested = linked.join("mock-root");
+        let port = 50_414u16;
+        let token = generate_token().expect("token");
+
+        match write_lockfile(&requested, port, &token) {
+            Ok(discovery) => {
+                let canonical_root = std::fs::canonicalize(&requested).expect("canonical root");
+                assert_eq!(
+                    discovery.path(),
+                    canonical_root.join("lockfile").as_path(),
+                    "writes must use the canonical root, never the raw input"
+                );
+                assert!(canonical_root.join("lockfile").exists());
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.exit_code(),
+                    2,
+                    "a rejected ancestor symlink is a usage error: {error}"
+                );
+                assert!(
+                    !nested.join("lockfile").exists(),
+                    "no file may be written for a rejected root"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_lockfile_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"untouched").expect("target");
+        let leaf = root.path().join("lockfile");
+        symlink(&target, &leaf).expect("leaf symlink");
+        let token = generate_token().expect("token");
+
+        let error = write_lockfile(root.path(), 50_414, &token)
+            .expect_err("a symlinked lockfile leaf must be rejected");
+        assert_ne!(error.exit_code(), 0, "{error}");
+        assert_eq!(
+            std::fs::read(&target).expect("target read"),
+            b"untouched",
+            "the symlink target must not be truncated"
+        );
+        assert!(std::fs::symlink_metadata(&leaf)
+            .expect("leaf metadata")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_bare_known_install_prefix_on_windows() {
+        let token = generate_token().expect("token");
+        let root = std::path::PathBuf::from(r"C:\Riot Games\aramkit-mock-test");
+        let error = write_lockfile(&root, 50_414, &token)
+            .expect_err("a known Riot Games prefix must be rejected");
+        assert_eq!(error.exit_code(), 2, "{error}");
+    }
+
+    #[test]
     fn clean_exit_removes_discovery_files() {
         let root = tempfile::tempdir().expect("temp dir");
         let port = 50_414u16;
