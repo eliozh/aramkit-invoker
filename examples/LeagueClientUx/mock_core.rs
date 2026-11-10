@@ -14,7 +14,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -30,6 +30,10 @@ const KEY_DER: &[u8] = include_bytes!("testdata/key.der");
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// Read and write timeout for one connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total wall-clock budget for reading one request head. The per-read timeout
+/// is an additional bound; together they stop a dripper from holding the
+/// single-threaded accept loop indefinitely (ADR-0007 slowloris rule).
+const HEAD_READ_DEADLINE: Duration = Duration::from_secs(5);
 /// Poll interval while the non-blocking listener waits for a connection.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -193,9 +197,12 @@ fn serve(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _peer)) => {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                // A socket we cannot configure (blocking mode and both
+                // timeouts) has no slowloris bound; close it instead of
+                // serving it without those guards.
+                if configure_stream(&stream).is_err() {
+                    continue;
+                }
 
                 let Ok(connection) = ServerConnection::new(Arc::clone(config)) else {
                     continue;
@@ -211,6 +218,15 @@ fn serve(
     }
 }
 
+/// Applies the blocking mode and both I/O timeouts. Returns the first error so
+/// the caller can decline to serve a socket without its slowloris bounds.
+fn configure_stream(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(())
+}
+
 fn handle_connection(
     stream: &mut StreamOwned<ServerConnection, TcpStream>,
     state: &Arc<RwLock<MockState>>,
@@ -223,10 +239,16 @@ fn handle_connection(
         // TLS handshake and socket errors close without an HTTP response.
         Err(_) => return,
     };
-    write_response(stream, &response);
+    // Best-effort write: the connection closes right after, so a write error
+    // only truncates the response and the socket drop ends the connection.
+    let _ = write_response(stream, &response);
 }
 
+/// Reads one request head with two bounds: `MAX_HEAD_BYTES` and a total
+/// `HEAD_READ_DEADLINE`. Returns `Ok(None)` when either bound is exceeded so
+/// the caller answers `400` and closes.
 fn read_request_head(stream: &mut impl Read) -> std::io::Result<Option<Vec<u8>>> {
+    let deadline = Instant::now() + HEAD_READ_DEADLINE;
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
 
@@ -237,9 +259,16 @@ fn read_request_head(stream: &mut impl Read) -> std::io::Result<Option<Vec<u8>>>
         if head.len() >= MAX_HEAD_BYTES {
             return Ok(None);
         }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
 
         let read = stream.read(&mut chunk)?;
         if read == 0 {
+            return Ok(None);
+        }
+        // Reject before appending: never let the head grow past the cap.
+        if head.len() + read > MAX_HEAD_BYTES {
             return Ok(None);
         }
         head.extend_from_slice(&chunk[..read]);
@@ -331,11 +360,13 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         return false;
     }
 
-    let mut difference = 0u8;
-    for (left, right) in left.iter().zip(right.iter()) {
-        difference |= left ^ right;
-    }
-    difference == 0
+    let difference = left
+        .iter()
+        .zip(right.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right));
+    // `black_box` keeps the compiler from folding or removing the OR
+    // reduction, which is what makes this comparison constant time.
+    std::hint::black_box(difference) == 0
 }
 
 fn route(path: &str, state: &Arc<RwLock<MockState>>, options: &MockOptions) -> MockResponse {
@@ -470,7 +501,10 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn write_response(stream: &mut StreamOwned<ServerConnection, TcpStream>, response: &MockResponse) {
+fn write_response(
+    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    response: &MockResponse,
+) -> std::io::Result<()> {
     let mut output = Vec::with_capacity(response.body.len() + 160);
     output.extend_from_slice(
         format!("HTTP/1.1 {} {}\r\n", response.status, response.reason).as_bytes(),
@@ -483,6 +517,7 @@ fn write_response(stream: &mut StreamOwned<ServerConnection, TcpStream>, respons
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&response.body);
 
-    let _ = stream.write_all(&output);
-    let _ = stream.flush();
+    // Best-effort on close: the caller discards any error from this write.
+    stream.write_all(&output)?;
+    stream.flush()
 }

@@ -278,7 +278,9 @@ env -u DISPLAY cargo test --all-targets --locked
 
 # Release isolation (AC-11).
 test ! -e target/release/examples/LeagueClientUx
-if cargo tree -e normal | grep -Eq ' (rustls|httparse|base64|getrandom) v'; then
+# Only rustls is slice-introduced; base64/httparse/getrandom are pre-existing
+# normal transitive deps of reqwest/hyper/tempfile, so they are not a leak signal.
+if [ -n "$(cargo tree -e normal -i rustls 2>/dev/null)" ]; then
   echo "mock dependency leaked into the normal dependency tree"; exit 1
 fi
 git diff --exit-code -- .github/workflows/build-windows.yml

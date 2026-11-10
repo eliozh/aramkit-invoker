@@ -56,12 +56,21 @@ mod mock_core;
 /// In-process end-to-end tests against the shared mock core.
 #[cfg(test)]
 mod mock_lcu_tests {
+    use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+    use std::sync::Arc;
+    use std::thread;
     use std::time::Duration;
 
     use base64::Engine;
     use reqwest::blocking::{Client, Response};
     use reqwest::header::{ACCEPT, AUTHORIZATION, LOCATION, WWW_AUTHENTICATE};
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{
+        ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned,
+    };
 
     use super::client::{build_client, fetch_champ_select, fetch_champion_catalog, fetch_gameflow};
     use super::creds::{parse_lcu_args, LcuCredentials};
@@ -106,6 +115,71 @@ mod mock_lcu_tests {
         socket.connect(("192.0.2.1", 9)).ok()?;
         let address = socket.local_addr().ok()?.ip();
         (!address.is_unspecified() && !address.is_loopback()).then_some(address)
+    }
+
+    /// Accepts the committed loopback test certificate without verifying it,
+    /// so raw TLS requests can be driven against the mock.
+    #[derive(Debug)]
+    struct AcceptAnyCertificate(Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for AcceptAnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    fn tls_client(port: u16) -> StreamOwned<ClientConnection, TcpStream> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("supported TLS versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate(provider)))
+            .with_no_client_auth();
+        let server_name = ServerName::try_from("127.0.0.1".to_owned()).expect("server name");
+        let connection =
+            ClientConnection::new(Arc::new(config), server_name).expect("client connection");
+        let tcp = TcpStream::connect(("127.0.0.1", port)).expect("tls connect");
+        StreamOwned::new(connection, tcp)
     }
 
     #[test]
@@ -494,6 +568,41 @@ mod mock_lcu_tests {
         assert_eq!(summary.status(), reqwest::StatusCode::OK);
         assert!(summary.content_length().expect("Content-Length") < 4096);
         assert!(summary.bytes().expect("body").len() < 4096);
+    }
+
+    #[test]
+    fn oversized_request_head_gets_400_without_panicking() {
+        let (_server, credentials) = start_server(MockOptions::default());
+        let mut tls = tls_client(credentials.port);
+
+        // Build a valid request head well over the 8 KiB cap. Flush 8000
+        // bytes first so the server drains them, then send the remainder.
+        // The final read therefore crosses the cap, which must be rejected
+        // before any of those bytes are appended to the head buffer.
+        let prefix = "GET /lol-gameflow/v1/session HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
+        let total = 8 * 1024 + 128;
+        let padding = "a".repeat(total - prefix.len() - 4);
+        let head = format!("{prefix}{padding}\r\n\r\n");
+        assert!(head.len() > 8 * 1024);
+
+        let bytes = head.as_bytes();
+        let split = 8000;
+        tls.write_all(&bytes[..split]).expect("first head chunk");
+        tls.flush().expect("flush first head chunk");
+        // Let the server consume the first chunk so the next read is partial.
+        thread::sleep(Duration::from_millis(250));
+        tls.write_all(&bytes[split..]).expect("second head chunk");
+        tls.flush().expect("flush second head chunk");
+
+        let mut response = Vec::new();
+        // The server sends the response and closes; a missing TLS
+        // close_notify is irrelevant to the assertion.
+        let _ = tls.read_to_end(&mut response);
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(
+            response_text.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "an oversized request head must get 400, got: {response_text:?}"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ version = "0.1.1"
 edition = "2021"
 description = "League of Legends ARAM Mayhem helper that opens ARAMKit champion pages automatically"
 license = "MIT"
+exclude = ["examples/LeagueClientUx/"]
 
 [dependencies]
 anyhow = "1"
