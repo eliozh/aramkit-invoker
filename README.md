@@ -83,6 +83,91 @@ flowchart LR
 
 触发只在“英雄选择结束并进入游戏”时发生，因此英雄选择期间有人秒退不会打开页面。英雄在海克斯大乱斗中换人（骰子/交换）时，会记录最后一次看到的英雄。
 
+## 开发者：本地 LCU mock（仅开发/测试）
+
+仓库包含一个**仅用于开发与测试**的本地 LCU mock：`examples/LeagueClientUx/`。它的可执行目标名就是
+`LeagueClientUx`（Windows 上为 `LeagueClientUx.exe`），因此未修改的应用会像发现真实客户端一样发现它。
+mock 只监听 `127.0.0.1`、使用 `Basic riot:<token>`、只提供应用实际使用的四个只读接口，**永远不会进入
+release 产物、安装包或 CI artifact**（`examples/` 不参与 `cargo build --release`）。
+
+### 构建与运行
+
+```bash
+cargo build --example LeagueClientUx
+cargo test --all-targets --locked
+cargo run --example LeagueClientUx -- --scenario mayhem
+```
+
+### 三种发现模式
+
+| 模式 | 命令 | 行为 |
+|---|---|---|
+| `process`（默认） | `cargo run --example LeagueClientUx -- --scenario mayhem` | 在进程 argv 中公布一次 `--app-port=<p> --remoting-auth-token=<t>`；缺少参数时自动选择回环端口、生成令牌，并重新执行自身一次。对应应用的 Candidate A。 |
+| `lockfile` | `cargo run --example LeagueClientUx -- --mode lockfile --install-root <绝对目录>` | 先写 `<root>/lockfile`（内容恰为 `LeagueClientUx:<pid>:<port>:<token>:https`），再开始监听。不在 argv 中公布凭证。对应 Candidate B。 |
+| `log` | `cargo run --example LeagueClientUx -- --mode log --install-root <绝对目录>` | 先写 `<root>/Game/Logs/LeagueClient Logs/<timestamp>_LeagueClientUx.log`，前 64 KiB 含 `--app-port=<p> --remoting-auth-token=<t>`，再开始监听。对应 Candidate B 的日志回退。 |
+
+`--install-root` 只能用于 `lockfile`/`log` 模式（在 `process` 模式下会以退出码 2 拒绝）。默认根目录是 mock
+可执行文件所在目录。写入前会严格校验根目录：
+
+- 必须是**已存在的绝对目录**；拒绝相对路径、UNC 路径（`\\server\share`、`//server/share`）、`..` 和符号链接。
+- 拒绝已知的 Riot/Tencent/WeGame 安装前缀，以及包含 `LeagueClient.exe`、或包含非 mock 自身的
+  `LeagueClientUx.exe` 的目录。
+- 只允许上述两种输出路径；Unix 上文件权限为 `0600`，Windows 使用目录默认 ACL。
+- 收到 SIGINT（Ctrl+C，Windows 同样适用）或 SIGTERM 时，mock 会先停止监听、删除它创建的发现文件，再以退出码 0 结束。
+- SIGKILL（`kill -9`）和 SIGSTOP 不能被进程处理，因此会留下发现文件；请始终使用临时根目录，必要时手动删除。
+
+示例（PowerShell，Candidate B）：
+
+```powershell
+New-Item -ItemType Directory -Force "$env:TEMP\aramkit-lcu-mock" | Out-Null
+Copy-Item .\target\debug\examples\LeagueClientUx.exe "$env:TEMP\aramkit-lcu-mock\"
+& "$env:TEMP\aramkit-lcu-mock\LeagueClientUx.exe" --mode lockfile --install-root "$env:TEMP\aramkit-lcu-mock"
+```
+
+必须先把示例二进制**复制到临时目录**再运行：应用会从进程映像路径推导安装根目录，复制后该根目录也是临时的，
+不会碰到真实安装。
+
+### 场景与开关
+
+- 默认 `--scenario mayhem`：`Lobby`（2×）→ `ChampSelect`（12×）→ `GameStart`（4×）→ `InProgress`（保持）。
+- `--step-ms <毫秒>`：每步的倍数，默认 `1000`（即 `ChampSelect` 约 12 秒、`GameStart` 约 4 秒）。手动联调建议
+  保持默认；低于约 `250` 会让应用来不及观察 `ChampSelect`。
+- `--scenario non-mayhem|dodge|failed-to-launch`：验证不触发路径。
+- `--reject-auth`：所有请求返回 `401`，用于观察应用的“客户端凭证已失效，正在重新读取”重试路径，且不打开页面。
+- `--gameflow-phase-only`：`/lol-gameflow/v1/session` 返回 `404`，让应用走 `/lol-gameflow/v1/gameflow-phase`
+  的裸字符串回退。
+- 静态固定状态：`--phase ChampSelect --queue-id 2400 --game-mode KIWI --champion-id 103 --local-cell-id 2`
+  直接提供指定阶段/队列/英雄，用于检查接口和界面（不依赖时间线）。
+
+```bash
+cargo run --example LeagueClientUx -- --phase ChampSelect --champion-id 103 --queue-id 2400 --game-mode KIWI
+cargo run --example LeagueClientUx -- --reject-auth
+cargo run --example LeagueClientUx -- --gameflow-phase-only --phase InProgress
+```
+
+### Windows 端到端验证
+
+1. **先完全退出真实的英雄联盟客户端**（TCLS/WeGame、Riot Client 和游戏进程），否则应用可能选中真实客户端。
+2. 在 Windows 上构建：`cargo build --example LeagueClientUx`。
+3. Candidate A：运行 `target\debug\examples\LeagueClientUx.exe --scenario mayhem`，再启动本应用。
+   - 预期：约 3 秒内应用从“请启动英雄联盟客户端”变为已连接；约 2 秒后进入 `ChampSelect`；
+     在 `GameStart`/`InProgress` 时**恰好打开一个** `https://aramkit.cn/zh-CN/champions/ahri` 页面。
+4. Candidate B：按上面的 PowerShell 片段把示例二进制复制到临时目录，以 `--mode lockfile`（或 `--mode log`）
+   运行，再启动本应用。
+   - 预期：应用通过 lockfile（或日志）完成发现，连接与触发行为应与 Candidate A 相同。
+   - 注意：Candidate B 的端到端发现仅限 Windows，因为应用的 `process_image_path` 只在 Windows 上可用；
+     Linux 上的 writer/parser 单测覆盖了文件格式本身。
+5. 可选：`Get-NetTCPConnection -LocalPort <port>` 应只看到 `127.0.0.1`。
+
+### 测试证书说明
+
+`examples/LeagueClientUx/testdata/cert.der` 和 `key.der` 是**提交在仓库中的、非机密的测试夹具**：自签名、
+只用于回环 mock 的 TLS，不用于生产、不安装进系统信任库、也不会随 release 发布。密钥公开是设计的一部分，
+它不能认证 mock 之外的任何东西；秘密扫描器可能会误报，这是已知且可接受的。
+
+mock 永远不会随产品发布：`Cargo.toml` 的 `exclude` 排除 `examples/LeagueClientUx/`，release 构建不会编译
+example，CI 只上传 `aramkit-invoker.exe`。
+
 ## 安全说明
 
 - 只访问 `https://127.0.0.1:<LCU端口>`，关闭系统代理并禁用 HTTP 重定向，避免请求离开回环地址。

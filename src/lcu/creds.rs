@@ -563,16 +563,17 @@ mod tests {
 
     #[test]
     fn reads_arguments_from_client_log_line() {
-        // Real CN client log line (`--region=TENCENT`).
+        // Synthetic CN client log line shape (`--region=TENCENT`). The token
+        // is deliberately a short placeholder, not a real credential.
         let text = "000000.000|   OKAY| Command line arguments: \
                     --riotclient-auth-token=other --riotclient-app-port=99999 \
-                    --region=TENCENT --remoting-auth-token=lK_KN5XQI4F4kDPt-8Am-A \
+                    --region=TENCENT --remoting-auth-token=abc-DEF_123 \
                     --app-port=50414 --app-pid=15424\r\n";
 
         assert_eq!(argument_value(text, "--app-port="), Some("50414"));
         assert_eq!(
             argument_value(text, "--remoting-auth-token="),
-            Some("lK_KN5XQI4F4kDPt-8Am-A")
+            Some("abc-DEF_123")
         );
         // Riot Client arguments must not be mistaken for the LCU ones.
         assert_eq!(
@@ -672,5 +673,49 @@ mod tests {
         let roots = install_roots(&processes);
         assert!(roots.contains(&PathBuf::from(r"D:\Games\英雄联盟\LeagueClient")));
         assert!(roots.contains(&PathBuf::from(r"D:\Games\英雄联盟")));
+    }
+
+    // The mock writes exactly `LeagueClientUx:<pid>:<port>:<token>:https`.
+    #[test]
+    fn parses_the_mock_lockfile_line() {
+        let token = "mock_TOKEN-0123456789=";
+        let line = format!("LeagueClientUx:{}:50414:{token}:https", std::process::id());
+
+        let credentials = parse_lockfile(&line).expect("the mock lockfile line");
+        assert_eq!(credentials.port, 50_414);
+        assert_eq!(credentials.token, token);
+        assert!(
+            is_valid_token(&credentials.token),
+            "the mock token is inside the app's charset"
+        );
+    }
+
+    // The mock writes `<timestamp>_LeagueClientUx.log` (no pid) with the
+    // launch arguments in the head and may leave NUL bytes behind, like the
+    // client.
+    #[test]
+    fn parses_the_mock_log_file_layout() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let directory = root
+            .path()
+            .join("Game")
+            .join("Logs")
+            .join("LeagueClient Logs");
+        std::fs::create_dir_all(&directory).expect("log dir");
+
+        let token = "mock_TOKEN-0123456789=";
+        let path = directory.join(format!("{}_LeagueClientUx.log", 1_700_000_000u64));
+        let mut contents = format!(
+            "000000.000|   OKAY| Command line arguments: --app-port=50414 \
+             --remoting-auth-token={token} --app-pid={} --region=MOCK\r\n",
+            std::process::id()
+        )
+        .into_bytes();
+        contents.extend_from_slice(b"\0binary\0tail\0");
+        std::fs::write(&path, contents).expect("write log");
+
+        let credentials = credentials_from_log_directory(&directory).expect("the mock log layout");
+        assert_eq!(credentials.port, 50_414);
+        assert_eq!(credentials.token, token);
     }
 }

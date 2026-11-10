@@ -24,6 +24,7 @@ webbrowser = "1.2"
 zeroize = "1"
 
 [dev-dependencies]
+libc = "=0.2.191"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 httparse = "=1.10.1"
 base64 = "=0.22.1"
