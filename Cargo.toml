@@ -6,6 +6,10 @@ description = "League of Legends ARAM Mayhem helper that opens ARAMKit champion 
 license = "MIT"
 exclude = ["examples/LeagueClientUx/"]
 
+[[example]]
+name = "LeagueClientUx"
+path = "examples/LeagueClientUx/main.rs"
+
 [dependencies]
 anyhow = "1"
 dirs = "7"

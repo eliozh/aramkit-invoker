@@ -74,7 +74,7 @@ mod mock_lcu_tests {
 
     use super::client::{build_client, fetch_champ_select, fetch_champion_catalog, fetch_gameflow};
     use super::creds::{parse_lcu_args, LcuCredentials};
-    use super::mock_core::{generate_token, MockOptions, MockServer};
+    use super::mock_core::{generate_token, resolve_launch, CliConfig, MockOptions, MockServer};
     use super::model::{ChampSelectSession, GameflowSession};
     use crate::champion::{champion_url_for_alias, is_mayhem_queue};
     use crate::tracker::ChampionTracker;
@@ -632,5 +632,538 @@ mod mock_lcu_tests {
 
         let catalog = fetch_champion_catalog(&client, &credentials).expect("catalog");
         assert_eq!(catalog.name_of(121), Some("Kha'Zix"));
+    }
+
+    // --- Slice 02: CLI parsing, re-exec resolution, and scripted timelines ---
+
+    fn parse_config(args: &[&str]) -> Result<CliConfig, super::mock_core::CliError> {
+        CliConfig::parse_from(args.iter().copied())
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    fn mayhem_for_state(state: &super::mock_core::MockState) -> Option<bool> {
+        if state.queue_id > 0 || is_mayhem_queue(state.queue_id, &state.game_mode) {
+            Some(is_mayhem_queue(state.queue_id, &state.game_mode))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn cli_rejects_unknown_flags_and_invalid_values() {
+        let error = parse_config(&["LeagueClientUx", "--nope"]).expect_err("unknown flag");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("--nope"), "{error}");
+
+        // Port: 0 selects an ephemeral port, anything else must be a valid u16.
+        for port in ["65536", "-1", "abc"] {
+            assert!(
+                parse_config(&["LeagueClientUx", "--app-port", port]).is_err(),
+                "port {port} must be rejected"
+            );
+        }
+        assert!(parse_config(&["LeagueClientUx", "--app-port", "0"]).is_ok());
+        assert!(parse_config(&["LeagueClientUx", "--app-port=54321"]).is_ok());
+
+        // Token: non-empty, at most 256 bytes, charset [A-Za-z0-9_=-].
+        assert!(parse_config(&["LeagueClientUx", "--remoting-auth-token", ""]).is_err());
+        let long = "a".repeat(257);
+        assert!(parse_config(&["LeagueClientUx", "--remoting-auth-token", long.as_str()]).is_err());
+        assert!(parse_config(&["LeagueClientUx", "--remoting-auth-token", "bad token!"]).is_err());
+        assert!(parse_config(&["LeagueClientUx", "--remoting-auth-token", "bad/token"]).is_err());
+        let maximum = "a".repeat(256);
+        assert!(
+            parse_config(&["LeagueClientUx", "--remoting-auth-token", maximum.as_str()]).is_ok()
+        );
+        assert!(parse_config(&["LeagueClientUx", "--remoting-auth-token", "Good_-Token="]).is_ok());
+
+        // Enumerated values and numeric IDs fail with a message naming the flag.
+        for (flag, value) in [
+            ("--mode", "bogus"),
+            ("--scenario", "bogus"),
+            ("--phase", "Bogus"),
+            ("--game-mode", ""),
+            ("--game-mode", "bad mode"),
+            ("--queue-id", "-1"),
+            ("--champion-id", "0"),
+            ("--local-cell-id", "-2"),
+            ("--step-ms", "0"),
+            ("--step-ms", "600001"),
+        ] {
+            let error = parse_config(&["LeagueClientUx", flag, value]).expect_err(flag);
+            assert!(error.to_string().contains(flag), "{flag}: {}", error);
+        }
+    }
+
+    #[test]
+    fn phase_and_explicit_scenario_are_mutually_exclusive() {
+        let error = parse_config(&[
+            "LeagueClientUx",
+            "--phase",
+            "ChampSelect",
+            "--scenario",
+            "dodge",
+        ])
+        .expect_err("phase plus explicit scenario");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("--phase"), "{error}");
+
+        let config = parse_config(&["LeagueClientUx", "--phase", "ChampSelect"]).expect("static");
+        let schedule = config.schedule();
+        assert_eq!(schedule.steps.len(), 1);
+        assert_eq!(schedule.steps[0].state.phase, "ChampSelect");
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(3_600)).phase,
+            "ChampSelect",
+            "static mode must hold forever"
+        );
+        assert!(
+            schedule
+                .steps
+                .iter()
+                .all(|step| step.state.phase == "ChampSelect"),
+            "the default mayhem timeline must not be applied in phase mode"
+        );
+    }
+
+    #[test]
+    fn install_root_is_rejected_in_process_mode() {
+        for argv in [
+            owned(&["LeagueClientUx", "--install-root", "/tmp/mock-root"]),
+            owned(&[
+                "LeagueClientUx",
+                "--mode",
+                "process",
+                "--install-root",
+                "/tmp/mock-root",
+            ]),
+        ] {
+            let error = CliConfig::parse_from(argv).expect_err("install-root in process mode");
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.to_string().contains("--install-root"), "{error}");
+        }
+
+        assert!(parse_config(&[
+            "LeagueClientUx",
+            "--mode",
+            "lockfile",
+            "--install-root",
+            "/tmp/mock-root",
+        ])
+        .is_ok());
+        assert!(parse_config(&[
+            "LeagueClientUx",
+            "--mode",
+            "log",
+            "--install-root",
+            "/tmp/mock-root",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn token_redaction_hides_the_generated_token() {
+        let token = generate_token().expect("token");
+        let config = CliConfig::parse_from([
+            "LeagueClientUx",
+            "--app-port",
+            "54321",
+            "--remoting-auth-token",
+            token.as_str(),
+            "--scenario",
+            "dodge",
+        ])
+        .expect("config");
+
+        let summary = config.summary(54_321);
+        assert!(summary.contains("process"), "{summary}");
+        assert!(summary.contains("dodge"), "{summary}");
+        assert!(summary.contains("54321"), "{summary}");
+        assert!(summary.contains("<redacted>"), "{summary}");
+        assert!(!summary.contains(&token), "the token must never be printed");
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(&token), "Debug must be redacted");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn resolve_launch_advertises_exactly_one_flag_pair() {
+        let argv = owned(&["LeagueClientUx", "--step-ms", "500"]);
+        let resolution = resolve_launch(
+            &argv,
+            None,
+            None,
+            || Ok::<u16, std::io::Error>(54_321),
+            || Ok::<String, std::io::Error>("generated-token".to_owned()),
+        )
+        .expect("resolution");
+
+        assert!(resolution.reexec);
+        assert_eq!(resolution.port, 54_321);
+        assert_eq!(resolution.token, "generated-token");
+
+        let port_flags = resolution
+            .args
+            .iter()
+            .filter(|argument| argument.starts_with("--app-port"))
+            .count();
+        let token_flags = resolution
+            .args
+            .iter()
+            .filter(|argument| argument.starts_with("--remoting-auth-token"))
+            .count();
+        assert_eq!(port_flags, 1, "exactly one --app-port");
+        assert_eq!(token_flags, 1, "exactly one --remoting-auth-token");
+        assert!(resolution.args.contains(&"--app-port=54321".to_owned()));
+        assert!(resolution
+            .args
+            .contains(&"--remoting-auth-token=generated-token".to_owned()));
+
+        let credentials = parse_lcu_args(&resolution.args).expect("parseable pair");
+        assert_eq!(credentials.port, 54_321);
+        assert_eq!(credentials.token, "generated-token");
+    }
+
+    #[test]
+    fn resolve_launch_strips_previous_flag_forms() {
+        let argv = owned(&[
+            "LeagueClientUx",
+            "--app-port=1111",
+            "--remoting-auth-token",
+            "old-token",
+            "--step-ms",
+            "400",
+            "--app-port",
+            "2222",
+            "--remoting-auth-token=fake",
+        ]);
+
+        let resolution = resolve_launch(
+            &argv,
+            None,
+            None,
+            || Ok::<u16, std::io::Error>(3333),
+            || Ok::<String, std::io::Error>("new-token".to_owned()),
+        )
+        .expect("resolution");
+
+        assert!(resolution.reexec);
+        assert_eq!(
+            resolution
+                .args
+                .iter()
+                .filter(|argument| argument.starts_with("--app-port"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            resolution
+                .args
+                .iter()
+                .filter(|argument| argument.starts_with("--remoting-auth-token"))
+                .count(),
+            1
+        );
+        assert!(resolution.args.contains(&"--app-port=3333".to_owned()));
+        assert!(resolution.args.contains(&"--step-ms".to_owned()));
+        assert!(resolution.args.contains(&"400".to_owned()));
+        for stale in ["1111", "2222", "old-token", "fake"] {
+            assert!(
+                !resolution
+                    .args
+                    .iter()
+                    .any(|argument| argument.contains(stale)),
+                "stale argument {stale} must be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_launch_child_does_not_reexec() {
+        let argv = owned(&[
+            "LeagueClientUx",
+            "--app-port=54321",
+            "--remoting-auth-token=child-token",
+        ]);
+        let config = CliConfig::parse_from(&argv).expect("child config");
+
+        let resolution = resolve_launch(
+            &argv,
+            config.app_port,
+            config.remoting_auth_token.as_deref(),
+            || -> std::io::Result<u16> { panic!("a child must not select a port") },
+            || -> std::io::Result<String> { panic!("a child must not generate a token") },
+        )
+        .expect("resolution");
+
+        assert!(!resolution.reexec, "the child must serve without re-exec");
+        assert_eq!(resolution.port, 54_321);
+        assert_eq!(resolution.token, "child-token");
+    }
+
+    #[test]
+    fn mayhem_timeline_state_at_boundaries() {
+        let config = parse_config(&[
+            "LeagueClientUx",
+            "--scenario",
+            "mayhem",
+            "--step-ms",
+            "1000",
+        ])
+        .expect("mayhem config");
+        let schedule = config.schedule();
+
+        assert_eq!(schedule.state_at(Duration::ZERO).phase, "Lobby");
+        assert_ne!(
+            schedule.state_at(Duration::ZERO).phase,
+            "InProgress",
+            "the timeline must never start in InProgress"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_millis(1_999)).phase,
+            "Lobby"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(2)).phase,
+            "ChampSelect"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(13)).phase,
+            "ChampSelect"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(14)).phase,
+            "GameStart"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(17)).phase,
+            "GameStart"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(18)).phase,
+            "InProgress"
+        );
+        assert_eq!(
+            schedule.state_at(Duration::from_secs(120)).phase,
+            "InProgress"
+        );
+
+        let game_start = schedule
+            .steps
+            .iter()
+            .find(|step| step.state.phase == "GameStart")
+            .expect("GameStart step");
+        assert!(
+            game_start.dwell_ms > 2_000 + 700,
+            "GameStart must outlast the 2 s grace plus one 700 ms poll"
+        );
+    }
+
+    #[test]
+    fn failed_scenarios_end_in_no_trigger_phases() {
+        for (name, ending_phase, queue_id, game_mode) in [
+            ("non-mayhem", "InProgress", 450, "ARAM"),
+            ("dodge", "Lobby", 2400, "KIWI"),
+            ("failed-to-launch", "FailedToLaunch", 2400, "KIWI"),
+        ] {
+            let config = parse_config(&["LeagueClientUx", "--scenario", name]).expect(name);
+            let schedule = config.schedule();
+            let last = schedule.state_at(Duration::from_secs(3_600));
+            assert_eq!(last.phase, ending_phase, "{name}");
+            assert_eq!(last.queue_id, queue_id, "{name}");
+            assert_eq!(last.game_mode, game_mode, "{name}");
+
+            let mut tracker = ChampionTracker::default();
+            for step in &schedule.steps {
+                let mayhem = mayhem_for_state(&step.state);
+                if step.state.phase == "ChampSelect" {
+                    tracker.begin_champ_select(step.state.game_id, mayhem);
+                    tracker.update_champ_select(
+                        step.state.game_id,
+                        mayhem,
+                        Some(step.state.champion_id),
+                    );
+                    continue;
+                }
+                assert!(
+                    tracker
+                        .on_phase(&step.state.phase, step.state.game_id, mayhem)
+                        .is_none(),
+                    "{name} must not trigger at {}",
+                    step.state.phase
+                );
+                assert!(
+                    tracker.fire_if_ready(step.state.game_id).is_none(),
+                    "{name} must not fire a pending pick at {}",
+                    step.state.phase
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn static_flags_pin_phase_queue_champion_and_cell() {
+        let config = parse_config(&[
+            "LeagueClientUx",
+            "--phase",
+            "ChampSelect",
+            "--queue-id",
+            "2400",
+            "--game-mode",
+            "KIWI",
+            "--champion-id",
+            "103",
+            "--local-cell-id",
+            "2",
+        ])
+        .expect("static flags");
+
+        let server = MockServer::start_on(0, None, config.mock_options(), Some(config.schedule()))
+            .expect("server");
+        let credentials = parse_lcu_args(server.argv()).expect("credentials");
+        let client = build_client().expect("client");
+
+        let session = fetch_gameflow(&client, &credentials).expect("gameflow");
+        assert_eq!(session.phase, "ChampSelect");
+        assert_eq!(session.queue().id, 2400);
+        assert_eq!(session.queue().game_mode, "KIWI");
+
+        let champ_select = fetch_champ_select(&client, &credentials)
+            .expect("champ select")
+            .expect("session");
+        assert_eq!(champ_select.local_player_cell_id, Some(2));
+        assert_eq!(champ_select.local_champion_id(), Some(103));
+
+        let catalog = fetch_champion_catalog(&client, &credentials).expect("catalog");
+        assert_eq!(catalog.name_of(103), Some("Ahri"));
+    }
+
+    #[test]
+    fn mayhem_path_triggers_exactly_once_with_expected_url() {
+        let config = parse_config(&["LeagueClientUx", "--scenario", "mayhem"]).expect("mayhem");
+        let schedule = config.schedule();
+        let (server, credentials) = start_server(MockOptions::default());
+        let client = build_client().expect("client");
+        let mut tracker = ChampionTracker::default();
+        let mut triggers = Vec::new();
+
+        for step in &schedule.steps {
+            {
+                let state = server.state();
+                *state.write().expect("state") = step.state.clone();
+            }
+            let session = fetch_gameflow(&client, &credentials).expect("gameflow");
+            let mayhem = mayhem_of(&session);
+
+            if session.phase == "ChampSelect" {
+                let champ_select = fetch_champ_select(&client, &credentials)
+                    .expect("champ select")
+                    .expect("session");
+                tracker.begin_champ_select(session.game_id(), mayhem);
+                tracker.update_champ_select(
+                    session.game_id(),
+                    mayhem,
+                    champ_select.local_champion_id(),
+                );
+            } else if let Some(trigger) =
+                tracker.on_phase(&session.phase, session.game_id(), mayhem)
+            {
+                triggers.push(trigger);
+            }
+        }
+
+        assert_eq!(triggers.len(), 1, "exactly one trigger");
+        assert_eq!(triggers[0].game_id, 424_242);
+        assert_eq!(triggers[0].champion_id, 103);
+
+        let catalog = fetch_champion_catalog(&client, &credentials).expect("catalog");
+        let alias = catalog.get(103).expect("champion").alias.clone();
+        assert_eq!(
+            champion_url_for_alias(&alias).as_deref(),
+            Some("https://aramkit.cn/zh-CN/champions/ahri")
+        );
+    }
+
+    #[test]
+    fn non_mayhem_dodge_and_failed_to_launch_do_not_trigger() {
+        for name in ["non-mayhem", "dodge", "failed-to-launch"] {
+            let config = parse_config(&["LeagueClientUx", "--scenario", name]).expect(name);
+            let schedule = config.schedule();
+            let (server, credentials) = start_server(MockOptions::default());
+            let client = build_client().expect("client");
+            let mut tracker = ChampionTracker::default();
+            let mut triggered = false;
+
+            for step in &schedule.steps {
+                {
+                    let state = server.state();
+                    *state.write().expect("state") = step.state.clone();
+                }
+                let session = fetch_gameflow(&client, &credentials).expect("gameflow");
+                let mayhem = mayhem_of(&session);
+
+                if session.phase == "ChampSelect" {
+                    let champ_select = fetch_champ_select(&client, &credentials)
+                        .expect("champ select")
+                        .expect("session");
+                    tracker.begin_champ_select(session.game_id(), mayhem);
+                    tracker.update_champ_select(
+                        session.game_id(),
+                        mayhem,
+                        champ_select.local_champion_id(),
+                    );
+                } else {
+                    triggered |= tracker
+                        .on_phase(&session.phase, session.game_id(), mayhem)
+                        .is_some();
+                    triggered |= tracker.fire_if_ready(session.game_id()).is_some();
+                }
+            }
+
+            assert!(!triggered, "{name} must not produce a trigger");
+        }
+    }
+
+    #[test]
+    fn phase_only_mode_returns_404_then_phase_without_trigger() {
+        let config = parse_config(&[
+            "LeagueClientUx",
+            "--phase",
+            "InProgress",
+            "--gameflow-phase-only",
+        ])
+        .expect("phase-only config");
+        let server = MockServer::start_on(0, None, config.mock_options(), Some(config.schedule()))
+            .expect("server");
+        let credentials = parse_lcu_args(server.argv()).expect("credentials");
+        let client = build_client().expect("client");
+
+        let response = raw_get(&client, &credentials, SESSION_PATH);
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(response.bytes().expect("body").is_empty());
+
+        let phase_response = raw_get(&client, &credentials, PHASE_PATH);
+        assert_eq!(phase_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(phase_response.text().expect("phase body"), "\"InProgress\"");
+
+        let session = fetch_gameflow(&client, &credentials).expect("phase fallback");
+        assert_eq!(session.phase, "InProgress");
+        assert_eq!(session.game_id(), 0);
+        assert_eq!(session.queue().id, 0);
+        assert_eq!(session.queue().game_mode, "");
+
+        let mut tracker = ChampionTracker::default();
+        tracker.begin_champ_select(0, None);
+        tracker.update_champ_select(0, None, Some(103));
+        assert_eq!(
+            tracker.on_phase(&session.phase, session.game_id(), mayhem_of(&session)),
+            None,
+            "phase-only mode has no queue data, so no trigger"
+        );
+        assert_eq!(tracker.fire_if_ready(session.game_id()), None);
     }
 }
