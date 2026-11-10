@@ -882,6 +882,13 @@ mod mock_lcu_tests {
             .expect_err("non-UTF-8 arguments must be rejected");
         assert_eq!(error.exit_code(), 2);
         assert!(error.to_string().contains("UTF-8"), "{error}");
+    }
+
+    // Not `#[cfg(unix)]`: this keeps `collect_utf8_args` live in the test build
+    // on Windows too, where the non-UTF-8 case above is not compiled.
+    #[test]
+    fn utf8_arguments_pass_through_unchanged() {
+        use std::ffi::OsString;
 
         let parsed = super::mock_core::collect_utf8_args(vec![
             OsString::from("LeagueClientUx"),
@@ -1312,8 +1319,12 @@ mod mock_lcu_tests {
         let port = 54_321u16;
         let token = generate_token().expect("token");
 
+        // The writer returns paths under its canonicalized root. On Windows
+        // that is a verbatim `\\?\` path with the 8.3 short name resolved, so
+        // the expected path must be built from the canonical root as well.
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
         let discovery = write_lockfile(root.path(), port, &token).expect("lockfile");
-        let expected_path = root.path().join("lockfile");
+        let expected_path = canonical_root.join("lockfile");
         assert_eq!(discovery.path(), expected_path.as_path());
         assert!(expected_path.exists(), "the lockfile must be written");
 
@@ -1355,8 +1366,11 @@ mod mock_lcu_tests {
         let token = generate_token().expect("token");
 
         let discovery = write_log(root.path(), port, &token).expect("log");
-        let log_directory = root
-            .path()
+        // Compare against the canonicalized root: the writer resolves symlinked
+        // ancestors, and on Windows it returns a verbatim `\\?\` path with the
+        // 8.3 short name expanded.
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let log_directory = canonical_root
             .join("Game")
             .join("Logs")
             .join("LeagueClient Logs");
@@ -1640,7 +1654,10 @@ mod mock_lcu_tests {
         let root = tempfile::tempdir().expect("temp dir");
         let port = 50_414u16;
         let token = generate_token().expect("token");
-        let lockfile_path = root.path().join("lockfile");
+        // See `lockfile_writer_emits_parseable_line`: the writer reports paths
+        // under the canonicalized root, not the raw temp root.
+        let canonical_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let lockfile_path = canonical_root.join("lockfile");
 
         {
             let discovery = write_lockfile(root.path(), port, &token).expect("lockfile");
