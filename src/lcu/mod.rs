@@ -1570,6 +1570,61 @@ mod mock_lcu_tests {
             .is_symlink());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hardlinked_lockfile_leaf() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"untouched").expect("target");
+        let leaf = root.path().join("lockfile");
+        // A hardlink is a regular file, so `O_NOFOLLOW` does not stop it.
+        std::fs::hard_link(&target, &leaf).expect("leaf hardlink");
+        let token = generate_token().expect("token");
+
+        let error = write_lockfile(root.path(), 50_414, &token)
+            .expect_err("a hardlinked lockfile leaf must be rejected");
+        assert_ne!(error.exit_code(), 0, "{error}");
+        assert_eq!(
+            std::fs::read(&target).expect("target read"),
+            b"untouched",
+            "the hardlink target must not be modified"
+        );
+        assert!(std::fs::metadata(&leaf).expect("leaf metadata").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignores_markers_in_world_writable_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().expect("temp dir");
+        let shared = base.path().join("shared");
+        std::fs::create_dir(&shared).expect("shared dir");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+            .expect("world-writable shared dir");
+        std::fs::write(shared.join("LeagueClient.exe"), b"").expect("planted marker");
+
+        let root = shared.join("run");
+        std::fs::create_dir(&root).expect("run root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("private run root");
+        let token = generate_token().expect("token");
+
+        {
+            let discovery = write_lockfile(&root, 50_414, &token)
+                .expect("a marker in a world-writable ancestor must be ignored");
+            assert!(discovery.path().exists());
+        }
+
+        // A marker inside the user-chosen root is still honored.
+        std::fs::write(root.join("LeagueClient.exe"), b"").expect("root marker");
+        let error = write_lockfile(&root, 50_414, &token)
+            .expect_err("a marker in the chosen root must still be rejected");
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(!root.join("lockfile").exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn rejects_bare_known_install_prefix_on_windows() {

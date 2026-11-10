@@ -60,11 +60,14 @@ impl Drop for DiscoveryFile {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             // Surface a failed cleanup (permissions, read-only root) instead of
             // silently leaving a token-bearing file behind. The path carries
-            // no credential.
-            Err(error) => eprintln!(
+            // no credential. Skipped while unwinding: `eprintln!` can itself
+            // panic (for example when stderr is closed), and a panic in a
+            // drop during unwinding aborts the process.
+            Err(error) if !std::thread::panicking() => eprintln!(
                 "mock-lcu: 无法删除发现文件 {}：{error}",
                 self.path.display()
             ),
+            Err(_) => {}
         }
     }
 }
@@ -105,9 +108,10 @@ pub fn write_log(root: &Path, port: u16, token: &str) -> Result<DiscoveryFile, C
         CliError::runtime(format!("无法创建日志目录 {}：{error}", directory.display()))
     })?;
 
-    // The created directory must still be a real directory (not a symlink
-    // planted by a race) before the file is written.
-    ensure_not_symlink(&directory)?;
+    // Every component created between the canonical root and the log directory
+    // must still be a real directory: `create_dir_all` can be raced, so a
+    // symlinked intermediate is rejected, not just the leaf.
+    reject_symlinked_components(&root, &directory)?;
     let metadata = std::fs::symlink_metadata(&directory)
         .map_err(|error| CliError::runtime(format!("无法检查日志目录：{error}")))?;
     if !metadata.is_dir() {
@@ -283,6 +287,15 @@ fn prefix_matches(prefix: &str, candidate: &str) -> bool {
 /// real League installation.
 fn reject_real_install_markers(canonical_root: &Path) -> Result<(), CliError> {
     for ancestor in canonical_root.ancestors() {
+        // On Unix any local user can plant a marker in a world-writable
+        // directory (notably the system temp dir), so such a marker is not
+        // evidence of a real install and must not deny the run. The chosen
+        // root itself is always checked.
+        #[cfg(unix)]
+        if ancestor != canonical_root && is_world_writable(ancestor) {
+            continue;
+        }
+
         if marker_present(&ancestor.join("LeagueClient.exe")) {
             return Err(CliError::usage(format!(
                 "--install-root 的上级目录包含 LeagueClient.exe，拒绝写入真实安装目录：{}",
@@ -306,6 +319,19 @@ fn reject_real_install_markers(canonical_root: &Path) -> Result<(), CliError> {
 /// the marker name still counts as a real-install marker.
 fn marker_present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+/// True when any local user may create entries in `directory` on Unix.
+///
+/// Markers found there are attacker-plantable and therefore ignored (see
+/// [`reject_real_install_markers`]).
+#[cfg(unix)]
+fn is_world_writable(directory: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::symlink_metadata(directory)
+        .map(|metadata| metadata.permissions().mode() & 0o002 != 0)
+        .unwrap_or(false)
 }
 
 /// True when `marker` is this process's own executable.
@@ -336,6 +362,27 @@ fn ensure_not_symlink(path: &Path) -> Result<(), CliError> {
             path.display()
         ))),
     }
+}
+
+/// Re-checks every component between the canonical root and `directory`.
+///
+/// The pre-creation checks can be raced: `create_dir_all` may walk a component
+/// that is replaced by a symlink in between. Walking the created path again
+/// rejects a symlinked intermediate, not only the leaf directory.
+fn reject_symlinked_components(root: &Path, directory: &Path) -> Result<(), CliError> {
+    let relative = directory.strip_prefix(root).map_err(|_| {
+        CliError::runtime(format!(
+            "日志目录不在 --install-root 内：{}",
+            directory.display()
+        ))
+    })?;
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        ensure_not_symlink(&current)?;
+    }
+    Ok(())
 }
 
 /// Rejects an existing leaf that is not a regular file (symlink, directory,
@@ -374,34 +421,88 @@ fn write_lockfile_contents(path: &Path, contents: &[u8]) -> Result<(), CliError>
 
 #[cfg(unix)]
 fn write_lockfile_inner(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        // Deliberately not truncated yet: a hardlink to an external file
+        // must be rejected before its contents are destroyed.
         .mode(0o600)
         // Never follow a symlink at the final component; close-on-exec keeps
         // the descriptor out of any spawned child.
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "发现文件不是普通文件",
         ));
     }
+    // `O_NOFOLLOW` does not stop a hardlink, which is still a regular file.
+    // A hardlink to an outside file would let the write escape the root, so
+    // reject it before truncating.
+    if metadata.nlink() > 1 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "发现文件存在额外硬链接",
+        ));
+    }
     // `mode` only applies on creation; tighten a pre-existing file too.
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents)?;
-    file.flush()
+    file.set_len(0)?;
+    write_contents_or_remove(&mut file, path, contents)
+}
+
+/// Prepares a destination that is about to be opened with `create_new` on
+/// platforms without `O_NOFOLLOW`: reject a symlink leaf and any other
+/// non-regular entry, and remove a stale regular file.
+///
+/// Compiled in tests on Unix as well so this Windows-only hardening is
+/// exercised on the CI host.
+#[cfg(any(not(unix), test))]
+fn prepare_new_lockfile_leaf(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "发现文件不是普通文件",
+        )),
+        Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path),
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "发现文件不是普通文件",
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(unix))]
 fn write_lockfile_inner(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    // Windows keeps the default user ACL of the destination directory.
-    std::fs::write(path, contents)
+    // Windows has no `O_NOFOLLOW`; check the leaf without following it, drop a
+    // stale regular file, then create exclusively so a pre-existing leaf can
+    // never be truncated or written through.
+    prepare_new_lockfile_leaf(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    write_contents_or_remove(&mut file, path, contents)
+}
+
+/// Writes and flushes `contents`, removing the created file when either step
+/// fails so a truncated or zero-byte lockfile is not left behind.
+fn write_contents_or_remove(
+    file: &mut impl std::io::Write,
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    if let Err(error) = file.write_all(contents).and_then(|()| file.flush()) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -429,4 +530,103 @@ fn create_log_file_inner(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     file.write_all(contents)?;
     file.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that always fails so the partial-file cleanup path is
+    /// exercised without a real full disk.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn removes_partial_lockfile_when_write_fails() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root.path().join("lockfile");
+        std::fs::write(&path, b"").expect("pre-create");
+
+        let error = write_contents_or_remove(&mut FailingWriter, &path, b"payload")
+            .expect_err("the injected write must fail");
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(
+            !path.exists(),
+            "a partially written lockfile must be removed"
+        );
+    }
+
+    #[test]
+    fn stale_regular_lockfile_leaf_is_removed() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let path = root.path().join("lockfile");
+        std::fs::write(&path, b"stale").expect("stale leaf");
+
+        prepare_new_lockfile_leaf(&path).expect("a stale regular leaf may be replaced");
+        assert!(!path.exists(), "the stale leaf must be removed");
+    }
+
+    #[test]
+    fn accepts_clean_directory_components() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let directory = root
+            .path()
+            .join("Game")
+            .join("Logs")
+            .join("LeagueClient Logs");
+        std::fs::create_dir_all(&directory).expect("dirs");
+
+        reject_symlinked_components(root.path(), &directory).expect("a clean tree is accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_leaf_before_create_new() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"untouched").expect("target");
+        let leaf = root.path().join("lockfile");
+        symlink(&target, &leaf).expect("leaf symlink");
+
+        let error = prepare_new_lockfile_leaf(&leaf).expect_err("a symlink leaf is rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read(&target).expect("target read"),
+            b"untouched",
+            "the symlink target must not be touched"
+        );
+        assert!(std::fs::symlink_metadata(&leaf)
+            .expect("leaf metadata")
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_intermediate_component() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp dir");
+        let outside = tempfile::tempdir().expect("outside");
+        let game = root.path().join("Game");
+        std::fs::create_dir(&game).expect("game dir");
+        symlink(outside.path(), game.join("Logs")).expect("logs symlink");
+        let directory = game.join("Logs").join("LeagueClient Logs");
+
+        let error = reject_symlinked_components(root.path(), &directory)
+            .expect_err("a symlinked intermediate component must be rejected");
+        assert_eq!(error.exit_code(), 2, "{error}");
+    }
 }

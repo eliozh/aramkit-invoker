@@ -95,7 +95,9 @@ fn install_signal(signal: libc::c_int) -> Result<(), CliError> {
     // returned previous handler is compared, not called.
     let previous =
         unsafe { libc::signal(signal, request_shutdown as *const () as libc::sighandler_t) };
-    if previous == libc::SIG_ERR {
+    // `SIG_ERR` is a `c_int` (-1) on Windows but a `sighandler_t` on Unix, so
+    // compare through the handler type to keep this portable.
+    if previous == libc::SIG_ERR as libc::sighandler_t {
         let error = std::io::Error::last_os_error();
         return Err(CliError::runtime(format!(
             "无法为信号 {signal} 注册清理处理器：{error}"
