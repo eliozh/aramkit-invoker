@@ -2,3 +2,8 @@
 *.pdb
 *.ilk
 .DS_Store
+
+# ECC workflow local records
+.claude/*.local.md
+.claude/settings.local.json
+.claude/ecc-workflow/
